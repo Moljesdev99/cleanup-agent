@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/icon.png" width="160" alt="Cleanup Agent icon">
-</p>
-
 <h1 align="center">Cleanup Agent</h1>
 
 <p align="center">
