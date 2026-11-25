@@ -1,0 +1,4 @@
+#!/bin/sh
+# Purge local Time Machine snapshots to release retained disk space.
+# Installed to /usr/local/sbin/cleanup-thin-snapshots with a scoped sudoers rule.
+exec /usr/bin/tmutil thinlocalsnapshots / 20000000000 4

@@ -1,0 +1,1346 @@
+#!/usr/bin/env python3
+"""cleanup-agent: audita y (opcionalmente) limpia lo seguro de macOS.
+
+Uso:
+  cleanup-agent --report [--notify]        # solo escanea y genera reporte
+  cleanup-agent --choose [--dry-run]       # elige IDs interactivamente
+  cleanup-agent --pick S1,S4-S6 [--yes]    # borra IDs concretos de lo seguro
+  cleanup-agent --apply-safe [--yes]       # borra TODO lo seguro (con confirmacion)
+
+Nunca toca documentos personales, iCloud, Steam, Coast, Cap, etc.
+"""
+
+import argparse
+import datetime
+import fnmatch
+import glob
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+
+HOME = os.path.expanduser("~")
+LOG_DIR = os.path.join(HOME, "Library", "Logs", "cleanup-agent")
+REPORT_DIR = LOG_DIR
+LOG_PATH = os.path.join(LOG_DIR, "cleanup.log")
+CONFIG_DIR = os.path.join(HOME, ".config", "cleanup-agent")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+EXCLUDES_PATH = os.path.join(CONFIG_DIR, "excludes")
+QUARANTINE_DIR = os.path.join(HOME, "Library", "Application Support", "cleanup-agent", "quarantine")
+QUARANTINE_DAYS = 7
+
+SAFE = "safe"
+MEDIUM = "medium"
+RISKY = "risky"
+
+
+def human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.1f %s" % (n, unit)) if unit != "B" else ("%d B" % n)
+        n /= 1024.0
+
+
+def run(cmd, timeout=90):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=timeout)
+        return p.stdout.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def du_bytes(path):
+    if not os.path.exists(path):
+        return 0
+    out = run(["/usr/bin/du", "-sk", path], timeout=60).strip()
+    try:
+        return int(out.split()[0]) * 1024
+    except Exception:
+        return 0
+
+
+def disk_info():
+    out = run(["/bin/df", "-k", "/System/Volumes/Data"], timeout=30)
+    lines = out.splitlines()
+    if len(lines) >= 2:
+        f = lines[1].split()
+        if len(f) >= 4:
+            try:
+                return {"total": int(f[1]) * 1024, "used": int(f[2]) * 1024,
+                        "free": int(f[3]) * 1024}
+            except Exception:
+                pass
+    st = shutil.disk_usage("/System/Volumes/Data")
+    return {"total": st.total, "used": st.used, "free": st.free}
+
+
+def machine_info():
+    name = run(["/usr/sbin/scutil", "--get", "ComputerName"], timeout=15).strip()
+    hw = run(["/usr/sbin/system_profiler", "SPHardwareDataType"], timeout=60)
+
+    def f(label):
+        m = re.search(label + r":\s*(.+)", hw)
+        return m.group(1).strip() if m else ""
+
+    return {"name": name or "Mac",
+            "model": f("Model Name"),
+            "model_id": f("Model Identifier"),
+            "chip": f("Chip"),
+            "memory": f("Memory")}
+
+
+DISPLAY = {
+    "inc.attention.rem": "Coast", "so.cap.desktop": "Cap",
+    "com.apple.wallpaper": "Fondos", "Pictures": "Fotos", "Music": "Música",
+    "discord": "Discord", "Zoho Mail - Desktop": "Zoho Mail",
+    "ai.opencode.desktop": "OpenCode", "com.operasoftware.Opera": "Opera",
+    "com.raycast.macos": "Raycast", "com.wiheads.paste-setapp": "Paste",
+    "Setapp": "Setapp", "Mobile Documents": "iCloud Drive",
+}
+
+
+def display_name(path):
+    b = os.path.basename(path.rstrip("/"))
+    return DISPLAY.get(b, b)
+
+
+def bar(pct, n=10):
+    pct = max(0, min(100, pct))
+    filled = int(round(pct / 100.0 * n))
+    return "▓" * filled + "░" * (n - filled)
+
+
+def top_consumers(n=8):
+    paths = expand(os.path.join(HOME, "Library", "Application Support", "*"))
+    for d in ("Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures"):
+        p = os.path.join(HOME, d)
+        if os.path.exists(p):
+            paths.append(p)
+    if not paths:
+        return []
+    out = run(["/usr/bin/du", "-sk"] + paths, timeout=600)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2:
+            try:
+                rows.append((int(parts[0]) * 1024, parts[1]))
+            except Exception:
+                pass
+    rows.sort(reverse=True)
+    return rows[:n]
+
+
+_DISK_CACHE = {"ts": 0, "items": None}
+
+
+def top_subdirs(base, n=5):
+    if not os.path.isdir(base):
+        return []
+    out = run(["/usr/bin/du", "-sk"] + expand(os.path.join(base, "*")), timeout=300)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2:
+            try:
+                rows.append((int(parts[0]) * 1024, parts[1]))
+            except Exception:
+                pass
+    rows.sort(reverse=True)
+    return rows[:n]
+
+
+def disk_breakdown(force=False):
+    now = time.time()
+    if not force and _DISK_CACHE.get("items") and now - _DISK_CACHE.get("ts", 0) < 600:
+        return _DISK_CACHE["items"]
+    apps = du_bytes("/Applications")
+    home = du_bytes(HOME)
+    subs = [
+        ("🖼️", "Fotos", [os.path.join(HOME, "Pictures")]),
+        ("🎵", "Música", [os.path.join(HOME, "Music")]),
+        ("🎬", "Videos", [os.path.join(HOME, "Movies")]),
+        ("📄", "Documentos", [os.path.join(HOME, "Documents"), os.path.join(HOME, "Desktop")]),
+        ("⬇️", "Descargas", [os.path.join(HOME, "Downloads")]),
+        ("☁️", "iCloud", [os.path.join(HOME, "Library", "Mobile Documents")]),
+        ("🗂️", "Cachés", [os.path.join(HOME, "Library", "Caches"), os.path.join(HOME, ".cache")]),
+        ("⚙️", "Datos de apps", [os.path.join(HOME, "Library", "Application Support")]),
+        ("🧰", "Contenedores", [os.path.join(HOME, "Library", "Containers"),
+                                os.path.join(HOME, "Library", "Group Containers")]),
+    ]
+    items = [{"emoji": "📦", "name": "Aplicaciones", "bytes": apps}]
+    total_sub = 0
+    for emoji, name, paths in subs:
+        size = sum(du_bytes(p) for p in paths)
+        total_sub += size
+        items.append({"emoji": emoji, "name": name, "bytes": size})
+    items.append({"emoji": "🗃️", "name": "Resto de tu carpeta", "bytes": max(0, home - total_sub)})
+    used = disk_info()["used"]
+    items.append({"emoji": "🖥️", "name": "Sistema y otros", "bytes": max(0, used - apps - home)})
+    items = [i for i in items if i["bytes"] > 0]
+    items.sort(key=lambda x: -x["bytes"])
+    _DISK_CACHE.update({"ts": now, "items": items})
+    return items
+
+
+def log(msg):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(LOG_PATH, "a") as f:
+        f.write("[%s] %s\n" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+
+
+def expand(pattern):
+    return sorted(glob.glob(pattern))
+
+
+def item(name, path, risk, action="delete", kind="dir", note=""):
+    if kind != "brew" and path and os.path.exists(path):
+        kind = "file" if os.path.isfile(path) else "dir"
+    return {"name": name, "path": path, "risk": risk, "action": action,
+            "kind": kind, "bytes": du_bytes(path), "note": note}
+
+
+ICONS = [
+    ("papelera", "🗑️"), ("trash", "🗑️"), ("notion", "📓"), ("discord", "💬"),
+    ("aside", "🧩"), ("homebrew", "🍺"), ("safari", "🧭"), ("orbstack", "🐳"),
+    ("updater", "⬆️"), ("claude", "🤖"), ("whatsapp", "☁️"),
+    ("coast", "🌊"), ("steam", "🎮"), ("cap", "🎥"), ("icloud", "☁️"),
+    ("pictures", "🖼️"), ("fotos", "🖼️"), ("music", "🎵"), ("música", "🎵"),
+    ("zoho", "📧"), ("mail", "📧"), ("opera", "🌐"), ("comet", "🌐"),
+    ("chrome", "🌐"), ("raycast", "🔎"), ("paste", "📋"), ("setapp", "🧰"),
+    ("desktop", "🖥️"), ("documents", "📄"), ("downloads", "⬇️"), ("movies", "🎬"),
+    ("video", "🎬"), ("logs", "📝"), ("instalador", "📦"), ("archivo", "📦"),
+    ("cache", "🗂️"),
+]
+
+DESC = [
+    ("papelera", "🗑️", "Papelera", "Archivos que ya borraste. Vacíala para liberar espacio; después no se recupera."),
+    ("trash", "🗑️", "Papelera", "Archivos que ya borraste. Vacíala para liberar espacio; después no se recupera."),
+    ("logs", "📝", "Registros", "Logs de diagnóstico. Borrarlos no rompe nada; solo pierdes historial de errores."),
+    ("notion", "📓", "Notion (caché)", "Copia temporal de tus páginas. Tus notas están en la nube; no se borran."),
+    ("discord", "💬", "Discord (caché)", "Imágenes y datos temporales. No afecta chats ni sesiones."),
+    ("aside", "🧩", "Aside (caché)", "Datos temporales del navegador Aside. No afecta sesiones ni favoritos."),
+    ("homebrew", "🍺", "Homebrew (caché)", "Caché y versiones viejas de paquetes. No rompe lo instalado."),
+    ("safari", "🧭", "Safari WebApp (caché)", "Caché de una web app. No cierra sesión; se regenera."),
+    ("orbstack", "🐳", "OrbStack (restos)", "Datos de OrbStack/Docker ya desinstalado. Seguro de borrar."),
+    ("updater", "⬆️", "Actualizadores", "Instaladores viejos de actualizaciones. Seguro; se re-descargan si hacen falta."),
+    ("claude", "🤖", "Claude (versión vieja)", "Versión anterior de Claude Code. Se puede volver a descargar."),
+    ("whatsapp backup", "☁️", "Respaldo de WhatsApp", "Copia en iCloud para restaurar WhatsApp en un teléfono nuevo. No la borres si no tienes otra."),
+    ("coast", "🌊", "Coast", "Grabación de pantalla e historial de actividad. Puedes podar videos viejos sin perder texto."),
+    ("steam", "🎮", "Steam", "Juegos instalados. Borrar libera mucho, pero pierdes la instalación."),
+    ("cap", "🎥", "Cap", "Grabaciones de pantalla hechas con Cap."),
+    ("icloud", "☁️", "iCloud Drive", "Archivos sincronizados; borrar aquí los borra en todos tus dispositivos."),
+    ("pictures", "🖼️", "Fotos", "Tu fototeca personal. No la borres desde el agente."),
+    ("fotos", "🖼️", "Fotos", "Tu fototeca personal. No la borres desde el agente."),
+    ("music", "🎵", "Música", "Tu biblioteca de Música."),
+    ("música", "🎵", "Música", "Tu biblioteca de Música."),
+    ("instalador", "📦", "Instalador", "Archivo .dmg/.pkg/.iso en Descargas. Revísalo antes de borrar."),
+    ("archivo grande", "📦", "Archivo grande", "Archivo personal. No es caché; decídelo tú."),
+    ("archivo", "📦", "Archivo", "Archivo personal. Revísalo antes de borrar."),
+    ("cache", "🗂️", "Caché", "Archivos temporales que las apps regeneran solas. Borrarlos no afecta tus datos ni sesiones."),
+]
+
+DETAILS = {
+    "papelera": ("Todo lo que está en la Papelera.", "Nada: lo que está ahí ya lo borraste antes.", "No se puede recuperar después."),
+    "trash": ("Todo lo que está en la Papelera.", "Nada: lo que está ahí ya lo borraste antes.", "No se puede recuperar después."),
+    "logs": ("Archivos de registro/diagnóstico de esa app.", "La app, tus datos y tu configuración.", "Solo pierdes historial de errores."),
+    "notion": ("Caché y datos temporales de Notion (no tus páginas).", "Tus notas, tu cuenta y tu sesión.", "Ninguno; Notion lo vuelve a descargar."),
+    "discord": ("Caché, logs e imágenes temporales de Discord.", "Tus chats, tu cuenta y tu sesión.", "Ninguno."),
+    "aside": ("Caché de componentes del navegador Aside.", "Pestañas, sesiones, favoritos y cuenta.", "Ninguno."),
+    "homebrew": ("Caché y versiones viejas descargadas por Homebrew.", "Paquetes instalados y sus versiones activas.", "Ninguno."),
+    "safari": ("Caché de la web app (no la sesión).", "Tu sesión, contraseñas y datos de la web app.", "Ninguno; se regenera."),
+    "orbstack": ("Datos y discos de OrbStack/Docker.", "Nada: la app ya no está instalada.", "Ninguno."),
+    "updater": ("Instaladores viejos de actualizaciones.", "La app instalada y su versión actual.", "Ninguno."),
+    "claude": ("Una versión anterior del binario de Claude Code.", "Tu versión actual y tu configuración.", "Ninguno; se puede re-descargar."),
+    "whatsapp backup": ("La copia local del respaldo de WhatsApp.", "El respaldo en iCloud (si existe) y WhatsApp en tu teléfono.", "Pierdes el punto de restauración local."),
+    "coast": ("Videos e índice de grabación de pantalla de Coast.", "El texto indexado si solo podas videos. Cierra Coast antes de borrar.", "Pierdes poder rebobinar ese periodo."),
+    "steam": ("Juegos instalados de Steam.", "Tu cuenta y partidas en la nube (según el juego).", "Tendrías que reinstalar."),
+    "cap": ("Grabaciones de pantalla hechas con Cap.", "La app Cap.", "Pierdes esas grabaciones."),
+    "icloud": ("Archivos sincronizados en iCloud Drive.", "Nada: se borra en todos tus dispositivos.", "Pérdida en todos tus dispositivos."),
+    "pictures": ("Tu fototeca personal.", "Nada.", "Pérdida de fotos. No hacer desde el agente."),
+    "fotos": ("Tu fototeca personal.", "Nada.", "Pérdida de fotos. No hacer desde el agente."),
+    "music": ("Tu biblioteca de Música.", "Nada.", "Pérdida de música."),
+    "música": ("Tu biblioteca de Música.", "Nada.", "Pérdida de música."),
+    "instalador": ("El archivo instalador (.dmg/.pkg/.iso).", "La app ya instalada.", "Ninguno si ya la instalaste."),
+    "archivo grande": ("El archivo personal indicado.", "El resto de tus archivos.", "Puedes perder ese archivo. Decídelo tú."),
+    "archivo": ("El archivo personal indicado.", "El resto de tus archivos.", "Revísalo antes de borrar."),
+    "cache": ("Archivos temporales (caché) de esa app.", "Tus datos, sesiones, historial y configuración.", "Ninguno: la app los regenera."),
+}
+
+APP_INFO = {
+    "Coast": "grabación de pantalla", "Steam": "juegos instalados",
+    "Fotos": "fototeca personal",
+    "Aside": "navegador con IA", "Discord": "app de chat", "Música": "biblioteca",
+    "Zoho Mail": "correo y adjuntos", "OpenCode": "editor/agente", "Opera": "navegador",
+    "Raycast": "lanzador", "Paste": "portapapeles", "iCloud Drive": "nube",
+    "Fondos": "fondos de pantalla", "Setapp": "apps de Setapp",
+}
+
+
+def icon_for(name):
+    low = (name + " " + display_name(name)).lower()
+    for k, v in ICONS:
+        if k in low:
+            return v
+    return "•"
+
+
+def _desc_by_key(key):
+    for k, emoji, title, desc in DESC:
+        if k == key:
+            return k, emoji, title, desc
+    return "generic", "•", "Elemento", "Archivo temporal. Revísalo antes de borrar."
+
+
+def _desc_match(name):
+    low = name.lower()
+    # Las cachés se explican como caché (aunque su nombre contenga "iCloud", "Discord", etc.)
+    if low.startswith(("cache: ", "~/.cache: ")):
+        for key in ("homebrew", "aside", "claude", "orbstack"):
+            if key in low:
+                return _desc_by_key(key)
+        return _desc_by_key("cache")
+    for pre, key in (("logs: ", "logs"), ("notion: ", "notion"), ("discord: ", "discord"),
+                     ("updater: ", "updater"), ("aside: ", "aside"), ("orbstack", "orbstack"),
+                     ("safari", "safari"), ("papelera", "papelera"), ("trash", "trash")):
+        if low.startswith(pre):
+            return _desc_by_key(key)
+    for key, emoji, title, desc in DESC:
+        if key in low:
+            return key, emoji, title, desc
+    return "generic", "•", "Elemento", "Archivo temporal. Revísalo antes de borrar."
+
+
+def describe(name):
+    _, emoji, title, desc = _desc_match(name)
+    return emoji, title, desc
+
+
+def dir_summary(path):
+    n = 0
+    total = 0
+    mn = None
+    mx = None
+    try:
+        for root, dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    st = os.stat(os.path.join(root, f))
+                except Exception:
+                    continue
+                n += 1
+                total += st.st_size
+                mn = st.st_mtime if mn is None else min(mn, st.st_mtime)
+                mx = st.st_mtime if mx is None else max(mx, st.st_mtime)
+    except Exception:
+        pass
+    return n, total, mn, mx
+
+
+def coast_running():
+    return bool(run(["/usr/bin/pgrep", "-f", "Coast Local"], timeout=10).strip())
+
+
+def specific_detail(it):
+    name = it["name"]
+    low = name.lower()
+    path = it.get("path") or ""
+    if low.startswith("coast: videos") and os.path.isdir(path):
+        n, total, mn, mx = dir_summary(path)
+        rng = ""
+        if mn and mx:
+            rng = ", del %s al %s" % (datetime.datetime.fromtimestamp(mn).strftime("%d %b"),
+                                       datetime.datetime.fromtimestamp(mx).strftime("%d %b %Y"))
+        s = "%d clips de ~50 s (HEVC), %s%s." % (n, human(total), rng)
+        if coast_running():
+            s += " ⚠️ Coast está abierto: ciérralo antes de borrar."
+        return s
+    if low.startswith("coast: rem.db"):
+        s = "Base SQLite de %s con el índice de frames, texto OCR y ventanas de Coast." % human(it["bytes"])
+        if coast_running():
+            s += " ⚠️ Coast está abierto: ciérralo antes de borrar."
+        return s
+    if low.startswith("cap:") and os.path.isdir(path):
+        s = "Proyecto de grabación de Cap (%s, 30 fps)." % human(it["bytes"])
+        try:
+            meta = json.load(open(os.path.join(path, "recording-meta.json")))
+            pn = meta.get("pretty_name")
+            if pn:
+                s = "Grabación «%s» (%s, 30 fps)." % (pn, human(it["bytes"]))
+            if (meta.get("upload") or {}).get("state") == "Complete":
+                link = (meta.get("sharing") or {}).get("link")
+                s += " Ya está subida a la nube" + ((" (%s)" % link) if link else "") + "; borrar local no borra el enlace."
+            else:
+                s += " Aún no está subida a la nube; si la borras, se pierde."
+        except Exception:
+            pass
+        return s
+    if low.startswith("steam:"):
+        return "Juego instalado (%s). Si lo borras, Steam lo tendrá que reinstalar." % human(it["bytes"])
+    if low.startswith("instalador"):
+        return "Instalador ya descargado. Si ya instalaste la app, no lo necesitas."
+    if low.startswith("archivo grande"):
+        return "Archivo personal de %s. No es caché; revísalo antes." % human(it["bytes"])
+    if low.startswith("claude"):
+        return "Versión anterior de Claude Code; se puede volver a descargar."
+    return ""
+
+
+def verdict(it):
+    risk = it.get("risk")
+    low = it["name"].lower()
+    if risk == RISKY:
+        return "⛔ No se puede borrar desde el agente.", "Protegido"
+    if risk == SAFE:
+        return "✅ Sí, se puede borrar.", "Bajo"
+    if low.startswith("coast: rem.db"):
+        return "⚠️ Sí, pero con cuidado.", "Alto (Coast pierde la búsqueda del historial)"
+    if low.startswith("coast"):
+        return "✅ Sí, se puede borrar.", "Medio (pierdes ese historial de pantalla)"
+    if low.startswith("steam"):
+        return "✅ Sí, se puede borrar.", "Medio (tendrías que reinstalar el juego)"
+    if low.startswith("cap"):
+        if is_cap_uploaded(it.get("path") or ""):
+            return "✅ Sí, borrado permanente (ya está en la nube).", "Bajo (hay copia en la nube)"
+        return "⚠️ Sí, se mueve a cuarentena (no está en la nube).", "Medio (pierdes la copia local)"
+    if low.startswith("archivo grande"):
+        return "⚠️ Sí, pero es un archivo tuyo.", "Alto (puedes perder ese archivo)"
+    if low.startswith(("instalador", "claude")):
+        return "✅ Sí, se puede borrar.", "Bajo"
+    return "✅ Sí, se puede borrar.", "Medio"
+
+
+def explain_item(it):
+    key, emoji, title, desc = _desc_match(it["name"])
+    deletes, keeps, impact = DETAILS.get(key, ("Los archivos de esa carpeta.", "Tus datos personales.", "Revísalo antes de borrar."))
+    rel = it["path"].replace(HOME, "~", 1) if it.get("path") else ""
+    v, risk_text = verdict(it)
+    spec = specific_detail(it)
+    ok_proc, proc = app_running(it.get("path") or "")
+    if ok_proc:
+        if it.get("risk") == SAFE:
+            spec = (spec + " ℹ️ %s está abierto: el caché se borra igual y se regenera." % proc).strip()
+        elif allow_open_delete(it.get("path") or ""):
+            spec = (spec + " ℹ️ %s está abierto: se puede borrar igual; no borres la grabación en curso." % proc).strip()
+        else:
+            spec = (spec + " ⚠️ %s está abierto: puedes forzar el borrado, pero puede corromper sus datos." % proc).strip()
+    return {"key": key, "emoji": emoji, "title": title, "what": desc,
+            "deletes": deletes, "keeps": keeps, "impact": impact,
+            "path": rel, "bytes": it["bytes"], "size": human(it["bytes"]), "risk": it["risk"],
+            "verdict": v, "risk_text": risk_text, "specific": spec,
+            "app_open": proc if ok_proc else None,
+            "can_delete": it.get("risk") != RISKY}
+
+
+def group_safe(safe):
+    groups = {}
+    for it in safe:
+        info = explain_item(it)
+        g = groups.setdefault(info["title"], {
+            "title": info["title"], "emoji": info["emoji"], "bytes": 0,
+            "paths": [], "deletes": info["deletes"], "keeps": info["keeps"],
+            "impact": info["impact"]})
+        g["bytes"] += it["bytes"]
+        if info["path"]:
+            g["paths"].append(info["path"])
+    return list(groups.values())
+
+
+# ------------------------------------------------------------------ scanning
+
+def scan_safe():
+    it = []
+
+    for p in expand(os.path.join(HOME, "Library", "Caches", "*")):
+        it.append(item("Cache: " + os.path.basename(p), p, SAFE))
+    for p in expand(os.path.join(HOME, ".cache", "*")):
+        it.append(item("~/.cache: " + os.path.basename(p), p, SAFE))
+    for p in expand(os.path.join(HOME, "Library", "Application Support", "Caches", "*")):
+        it.append(item("Updater: " + os.path.basename(p), p, SAFE))
+    for p in [os.path.join(HOME, ".npm"), os.path.join(HOME, ".pnpm-store"),
+              os.path.join(HOME, "Library", "Caches", "ms-playwright")]:
+        if os.path.exists(p):
+            it.append(item("Cache: " + os.path.basename(p), p, SAFE))
+
+    for p in expand(os.path.join(HOME, "Library", "Logs", "*")):
+        if os.path.basename(p) != "cleanup-agent":
+            it.append(item("Logs: " + os.path.basename(p), p, SAFE))
+
+    trash = os.path.join(HOME, ".Trash")
+    if os.path.exists(trash):
+        it.append(item("Papelera", trash, SAFE))
+
+    notion = os.path.join(HOME, "Library", "Application Support", "Notion", "Partitions")
+    for base in expand(os.path.join(notion, "*")):
+        for sub in ("Service Worker", "Cache", "Code Cache", "GPUCache",
+                    "DawnGPUCache", "DawnGraphiteCache", "DawnWebGPUCache"):
+            p = os.path.join(base, sub)
+            if os.path.exists(p):
+                it.append(item("Notion: " + sub, p, SAFE))
+
+    discord = os.path.join(HOME, "Library", "Application Support", "discord")
+    for sub in ("Cache", "logs", "Shared Dictionary", "component_crx_cache",
+                "Code Cache", "GPUCache", "GraphiteDawnCache", "DawnGraphiteCache",
+                "DawnWebGPUCache"):
+        p = os.path.join(discord, sub)
+        if os.path.exists(p):
+            it.append(item("Discord: " + sub, p, SAFE))
+
+    aside = os.path.join(HOME, "Library", "Application Support", "Aside")
+    for sub in ("component_crx_cache", "aside_component_crx_cache",
+                "extensions_crx_cache", "Crashpad", "AsideUpdater"):
+        p = os.path.join(aside, sub)
+        if os.path.exists(p):
+            it.append(item("Aside: " + sub, p, SAFE))
+
+    steam = os.path.join(HOME, "Library", "Application Support", "Steam")
+    for sub in ("appcache", "depotcache", "logs"):
+        p = os.path.join(steam, sub)
+        if os.path.exists(p):
+            it.append(item("Cache: Steam " + sub, p, SAFE))
+
+    rem = os.path.join(HOME, "Library", "Application Support", "inc.attention.rem")
+    for sub in ("icons", "tfidf_cache.json"):
+        p = os.path.join(rem, sub)
+        if os.path.exists(p):
+            it.append(item("Cache: Coast " + os.path.basename(sub), p, SAFE,
+                           kind="file" if os.path.isfile(p) else "dir"))
+
+    orb = os.path.join(HOME, "Library", "Group Containers", "HUAQ24HBR6.dev.orbstack")
+    if os.path.exists(orb) and not os.path.exists("/Applications/OrbStack.app"):
+        it.append(item("OrbStack: restos", orb, SAFE))
+
+    swa = os.path.join(HOME, "Library", "Containers", "com.apple.Safari.WebApp",
+                       "Data", "Library", "Containers")
+    for p in expand(os.path.join(swa, "*", "Library", "Caches")):
+        it.append(item("Safari WebApp: cache", p, SAFE))
+
+    brew = "/opt/homebrew/bin/brew" if os.path.exists("/opt/homebrew/bin/brew") else "/usr/local/bin/brew"
+    if os.path.exists(brew):
+        out = run([brew, "cleanup", "-n"], timeout=60)
+        m = re.search(r"approximately ([\d.]+)(KB|MB|GB)", out)
+        est = 0
+        if m:
+            mult = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}[m.group(2)]
+            est = int(float(m.group(1)) * mult)
+        it.append({"name": "Homebrew: brew cleanup -s", "path": "", "risk": SAFE,
+                   "action": "brew", "kind": "brew", "bytes": est, "note": "estimado"})
+
+    return [i for i in it if (i["bytes"] > 0 or i["kind"] == "brew")
+            and not path_excluded(i.get("path", ""))]
+
+
+def scan_medium():
+    it = []
+    for ext in ("dmg", "pkg", "iso"):
+        for p in expand(os.path.join(HOME, "Downloads", "*." + ext)):
+            it.append(item("Instalador: " + os.path.basename(p), p, MEDIUM, action="review", kind="file"))
+
+    steam_common = os.path.join(HOME, "Library", "Application Support", "Steam", "steamapps", "common")
+    for p in expand(os.path.join(steam_common, "*")):
+        if os.path.isdir(p):
+            it.append(item("Steam: " + os.path.basename(p), p, MEDIUM, action="review"))
+
+    cap = os.path.join(HOME, "Library", "Application Support", "so.cap.desktop", "recordings")
+    for p in expand(os.path.join(cap, "*")):
+        if os.path.isdir(p) and p.endswith(".cap"):
+            it.append(item("Cap: " + os.path.basename(p), p, MEDIUM, action="review"))
+
+    rem = os.path.join(HOME, "Library", "Application Support", "inc.attention.rem")
+    vids = os.path.join(rem, "videos")
+    if os.path.isdir(vids):
+        it.append(item("Coast: videos", vids, MEDIUM, action="review"))
+    db = os.path.join(rem, "rem.db")
+    if os.path.exists(db):
+        it.append(item("Coast: rem.db", db, MEDIUM, action="review", kind="file"))
+
+    out = run(["/usr/bin/find", HOME, "-type", "f", "-size", "+500M",
+               "-not", "-path", "*/Library/*", "-not", "-path", "*/.Trash/*"], timeout=180)
+    files = []
+    for line in out.splitlines():
+        try:
+            files.append((os.path.getsize(line), line))
+        except Exception:
+            pass
+    files.sort(reverse=True)
+    for size, p in files[:15]:
+        it.append({"name": "Archivo grande: " + os.path.basename(p), "path": p, "risk": MEDIUM,
+                   "action": "review", "kind": "file", "bytes": size, "note": ""})
+
+    vers = os.path.join(HOME, ".local", "share", "claude", "versions")
+    if os.path.isdir(vers):
+        vv = sorted([(du_bytes(os.path.join(vers, v)), os.path.join(vers, v)) for v in os.listdir(vers)], reverse=True)
+        for size, p in vv[1:]:
+            it.append({"name": "Claude version vieja: " + os.path.basename(p), "path": p,
+                       "risk": MEDIUM, "action": "review", "kind": "file",
+                       "bytes": size, "note": "se re-descarga"})
+    return [i for i in it if not path_excluded(i.get("path", ""))]
+
+
+def scan_risky():
+    known = [
+        ("☁️ iCloud Drive", os.path.join(HOME, "Library", "Mobile Documents")),
+        ("🖼️ Fotos", os.path.join(HOME, "Pictures")),
+    ]
+    wa_root = os.path.join(HOME, "Library", "Mobile Documents",
+                           "57T9237FN3~net~whatsapp~WhatsApp", "Accounts")
+    for b in expand(os.path.join(wa_root, "*", "backup")):
+        known.append(("☁️ WhatsApp backup (iCloud)", b))
+    it = []
+    for name, p in known:
+        if os.path.exists(p):
+            kind = "file" if os.path.isfile(p) else "dir"
+            it.append(item(name, p, RISKY, action="review", kind=kind, note="solo con aprobacion"))
+    return it
+
+
+def tm_snapshots():
+    out = run(["/usr/bin/tmutil", "listlocalsnapshots", "/"], timeout=60)
+    return [l.strip() for l in out.splitlines() if "TimeMachine" in l]
+
+
+def thin_snapshots():
+    """Purga snapshots locales via helper con sudoers NOPASSWD (sin prompt)."""
+    try:
+        p = subprocess.run(["/usr/bin/sudo", "-n", "/usr/local/sbin/cleanup-thin-snapshots"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        msg = (p.stdout or p.stderr).decode("utf-8", "replace").strip()
+        log("thin snapshots rc=%d: %s" % (p.returncode, msg[:200]))
+        return p.returncode == 0
+    except Exception as e:
+        log("thin snapshots error: %s" % e)
+        return False
+
+
+# ------------------------------------------------------------------ report
+
+# ------------------------------------------------------------------ seguridad
+
+DEFAULT_EXCLUDES = """# Rutas que cleanup-agent NUNCA tocará (una por línea, admite ~ y *)
+~/Documents
+~/Desktop
+~/.ssh
+~/Library/Mobile Documents
+"""
+
+APP_PROC = [
+    ("inc.attention.rem", "coast local"),
+    ("so.cap.desktop", "cap.app"),
+    ("/application support/steam", "steam"),
+    ("/discord", "discord"),
+    ("/notion", "notion"),
+    ("com.operasoftware.opera", "opera"),
+    ("/aside", "aside"),
+    ("/granola", "granola"),
+    ("/raycast", "raycast"),
+]
+
+_PS_CACHE = {"ts": 0, "out": ""}
+
+
+def ensure_excludes():
+    if not os.path.exists(EXCLUDES_PATH):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(EXCLUDES_PATH, "w") as f:
+            f.write(DEFAULT_EXCLUDES)
+        os.chmod(EXCLUDES_PATH, 0o600)
+
+
+_EXC_CACHE = {"ts": 0, "pats": []}
+
+
+def load_excludes():
+    now = time.time()
+    if now - _EXC_CACHE["ts"] < 5:
+        return _EXC_CACHE["pats"]
+    ensure_excludes()
+    pats = []
+    try:
+        with open(EXCLUDES_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    pats.append(os.path.expanduser(line))
+    except Exception:
+        pass
+    _EXC_CACHE.update({"ts": now, "pats": pats})
+    return pats
+
+
+def path_excluded(path):
+    if not path:
+        return False
+    p = os.path.realpath(os.path.expanduser(path))
+    for pat in load_excludes():
+        pat = os.path.expanduser(pat)
+        if any(ch in pat for ch in "*?["):
+            if fnmatch.fnmatch(p, pat) or fnmatch.fnmatch(os.path.basename(p), pat):
+                return True
+        else:
+            pp = os.path.realpath(pat)
+            if p == pp or p.startswith(pp + os.sep):
+                return True
+    return False
+
+
+def add_exclude(path):
+    ensure_excludes()
+    with open(EXCLUDES_PATH, "a") as f:
+        f.write(os.path.expanduser(path.strip()) + "\n")
+
+
+def remove_exclude(path):
+    ensure_excludes()
+    target = os.path.expanduser(path.strip())
+    lines = open(EXCLUDES_PATH).read().splitlines()
+    keep = [l for l in lines if l.strip() != target]
+    with open(EXCLUDES_PATH, "w") as f:
+        f.write("\n".join(keep) + "\n")
+    return len(lines) != len(keep)
+
+
+def running_ps():
+    now = time.time()
+    if now - _PS_CACHE["ts"] > 10:
+        _PS_CACHE["out"] = run(["/bin/ps", "-axo", "comm="], timeout=20).lower()
+        _PS_CACHE["ts"] = now
+    return _PS_CACHE["out"]
+
+
+def app_for_path(path):
+    low = (path or "").lower()
+    for key, proc in APP_PROC:
+        if key in low:
+            return proc
+    return None
+
+
+def app_running(path):
+    proc = app_for_path(path)
+    if not proc:
+        return (False, None)
+    return (proc in running_ps(), proc)
+
+
+def allow_open_delete(path):
+    """Rutas que se pueden borrar aunque su app esté abierta."""
+    low = (path or "").lower()
+    return "so.cap.desktop/recordings" in low
+
+
+def is_cap_uploaded(path):
+    try:
+        meta = json.load(open(os.path.join(path, "recording-meta.json")))
+        return (meta.get("upload") or {}).get("state") == "Complete"
+    except Exception:
+        return False
+
+
+def should_quarantine(it):
+    if it.get("risk") == SAFE:
+        return False
+    if it.get("name", "").lower().startswith("cap:") and is_cap_uploaded(it.get("path") or ""):
+        return False
+    return True
+
+
+def validate_item(it, force_open=False):
+    path = it.get("path") or ""
+    if not path:
+        return False, "sin ruta"
+    if not os.path.exists(path):
+        return False, "ya no existe"
+    real = os.path.realpath(path)
+    root = os.path.realpath(HOME)
+    if real == root:
+        return False, "es tu carpeta raíz"
+    if not real.startswith(root + os.sep):
+        return False, "fuera de tu carpeta"
+    if os.path.islink(path):
+        return False, "es un enlace simbólico"
+    if path_excluded(path):
+        return False, "está en exclusiones"
+    ok_proc, proc = app_running(path)
+    if ok_proc and it.get("risk") != SAFE and not allow_open_delete(path) and not force_open:
+        return False, "app abierta (%s)" % proc
+    if not (os.path.isfile(path) or os.path.isdir(path)):
+        return False, "ya no es archivo ni carpeta"
+    return True, ""
+
+
+def quarantine_ensure():
+    os.makedirs(QUARANTINE_DIR, exist_ok=True)
+
+
+def quarantine_add(it):
+    quarantine_ensure()
+    src = it.get("path")
+    if not src or not os.path.exists(src):
+        return None
+    eid = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + \
+        hashlib.sha1((src + str(time.time())).encode()).hexdigest()[:6]
+    edir = os.path.join(QUARANTINE_DIR, eid)
+    os.makedirs(edir, exist_ok=True)
+    payload = os.path.join(edir, "payload")
+    try:
+        shutil.move(src, payload)
+    except Exception as e:
+        log("quarantine move error %s: %s" % (src, e))
+        shutil.rmtree(edir, ignore_errors=True)
+        return None
+    meta = {"id": eid, "name": it.get("name"), "original_path": src,
+            "bytes": it.get("bytes", 0), "risk": it.get("risk"),
+            "kind": it.get("kind"), "created_at": time.time(),
+            "expires_at": time.time() + QUARANTINE_DAYS * 86400}
+    with open(os.path.join(edir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    log("quarantine %s -> %s" % (src, eid))
+    return eid
+
+
+def quarantine_list():
+    quarantine_ensure()
+    out = []
+    for eid in sorted(os.listdir(QUARANTINE_DIR)):
+        edir = os.path.join(QUARANTINE_DIR, eid)
+        mp = os.path.join(edir, "meta.json")
+        if os.path.isdir(edir) and os.path.exists(mp):
+            try:
+                meta = json.load(open(mp))
+                meta["id"] = eid
+                meta["days_left"] = max(0, int((meta.get("expires_at", 0) - time.time()) // 86400))
+                out.append(meta)
+            except Exception:
+                pass
+    return out
+
+
+def quarantine_restore(eid):
+    meta = {e["id"]: e for e in quarantine_list()}.get(eid)
+    if not meta:
+        return False, "no existe"
+    edir = os.path.join(QUARANTINE_DIR, eid)
+    payload = os.path.join(edir, "payload")
+    dest = meta.get("original_path", "")
+    if not dest:
+        return False, "sin ruta original"
+    if os.path.exists(dest):
+        return False, "la ruta original ya existe"
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(payload, dest)
+    except Exception as e:
+        return False, str(e)
+    shutil.rmtree(edir, ignore_errors=True)
+    log("restored %s -> %s" % (eid, dest))
+    return True, dest
+
+
+def quarantine_purge(eid=None):
+    quarantine_ensure()
+    ids = [eid] if eid else os.listdir(QUARANTINE_DIR)
+    purged, freed = 0, 0
+    for e in ids:
+        edir = os.path.join(QUARANTINE_DIR, e)
+        if not os.path.isdir(edir):
+            continue
+        try:
+            freed += json.load(open(os.path.join(edir, "meta.json"))).get("bytes", 0)
+        except Exception:
+            pass
+        shutil.rmtree(edir, ignore_errors=True)
+        purged += 1
+    log("quarantine purge: %d entries, ~%s" % (purged, human(freed)))
+    return purged, freed
+
+
+def quarantine_autopurge():
+    now = time.time()
+    purged, freed = 0, 0
+    for meta in quarantine_list():
+        if meta.get("expires_at", 0) < now:
+            shutil.rmtree(os.path.join(QUARANTINE_DIR, meta["id"]), ignore_errors=True)
+            freed += meta.get("bytes", 0)
+            purged += 1
+    if purged:
+        log("quarantine autopurge: %d entries, ~%s" % (purged, human(freed)))
+    return purged, freed
+
+
+def gather():
+    quarantine_autopurge()
+    safe = scan_safe()
+    medium = scan_medium()
+    risky = scan_risky()
+    safe.sort(key=lambda x: -x["bytes"])
+    medium.sort(key=lambda x: -x["bytes"])
+    risky.sort(key=lambda x: -x["bytes"])
+    for idx, s in enumerate(safe, 1):
+        s["id"] = "S%d" % idx
+    return safe, medium, risky, tm_snapshots()
+
+
+def report_text(safe, medium, risky, snaps):
+    now = datetime.datetime.now()
+    t_safe = sum(i["bytes"] for i in safe)
+    t_med = sum(i["bytes"] for i in medium)
+    t_risk = sum(i["bytes"] for i in risky)
+    d = disk_info()
+    tops = top_consumers(8)
+    mi = machine_info()
+    L = []
+    L.append("# 🧹 Reporte cleanup-agent")
+    L.append("💻 **%s** — %s (%s) · %s · %s" % (mi["name"], mi["model"], mi["model_id"], mi["chip"], mi["memory"]))
+    L.append("🗓️ %s" % now.strftime("%Y-%m-%d %H:%M"))
+    L.append("")
+    L.append("## 💽 Disco")
+    L.append("")
+    L.append("| Total | Usado | Libre |")
+    L.append("|---:|---:|---:|")
+    L.append("| %s | %s | **%s** |" % (human(d["total"]), human(d["used"]), human(d["free"])))
+    L.append("")
+    L.append("### 📦 En qué se usa")
+    L.append("")
+    L.append("| Qué | Tamaño |")
+    L.append("|---|---:|")
+    for it in disk_breakdown():
+        L.append("| %s %s | %s |" % (it["emoji"], it["name"], human(it["bytes"])))
+    L.append("")
+    L.append("## 📊 Resumen")
+    L.append("")
+    L.append("| Nivel | Tamaño |")
+    L.append("|---|---|")
+    L.append("| 🟢 Seguro (tú eliges) | **%s** |" % human(t_safe))
+    L.append("| 🟡 Revisar antes | %s |" % human(t_med))
+    L.append("| 🔴 Protegido (nunca automático) | %s |" % human(t_risk))
+    L.append("| ♻️ Potencial de liberación | **%s** |" % human(t_safe + t_med))
+    L.append("| 💾 Snapshots Time Machine | %d |" % len(snaps))
+    L.append("")
+    L.append("## 🏆 Qué ocupa más")
+    L.append("")
+    L.append("| Qué | Tamaño | Qué es |")
+    L.append("|---|---:|---|")
+    for size, p in tops:
+        nm = display_name(p)
+        L.append("| %s %s | %s | %s |" % (icon_for(nm), nm, human(size), APP_INFO.get(nm, "—")))
+    L.append("")
+    L.append("## ℹ️ Qué es cada cosa")
+    L.append("")
+    seen = set()
+    for it in safe + medium + risky:
+        e, t, dd = describe(it["name"])
+        if t in seen:
+            continue
+        seen.add(t)
+        L.append("- %s **%s**: %s" % (e, t, dd))
+    L.append("")
+    L.append("## 🧾 Qué se borra exactamente (solo 🟢 Seguro)")
+    L.append("")
+    for g in group_safe(safe):
+        L.append("### %s %s — %s" % (g["emoji"], g["title"], human(g["bytes"])))
+        L.append("")
+        L.append("- **Se borra:** %s" % g["deletes"])
+        if g["paths"]:
+            extra = " _(+%d rutas)_" % (len(g["paths"]) - 1) if len(g["paths"]) > 1 else ""
+            L.append("- **Ruta:** `%s`%s" % (g["paths"][0], extra))
+        L.append("- **No se borra:** %s" % g["keeps"])
+        L.append("- **Impacto:** %s" % g["impact"])
+        L.append("")
+    L.append("## 🟢 Seguro — elige qué borrar")
+    L.append("")
+    L.append("_Solo cachés y temporales. Tus documentos, fotos, chats y sesiones no se tocan._")
+    L.append("")
+    L.append("| ID | Qué | Tamaño |")
+    L.append("|:--:|---|---:|")
+    for s in safe[:50]:
+        L.append("| `%s` | %s %s | %s |" % (s["id"], icon_for(s["name"]), s["name"], human(s["bytes"])))
+    if len(safe) > 50:
+        L.append("| … | _y %d más_ | |" % (len(safe) - 50))
+    L.append("")
+    L.append("**Cómo elegir:**")
+    L.append("")
+    L.append("- `cleanup-agent --choose` → menú interactivo")
+    L.append("- `cleanup-agent --pick S1,S4-S6` → borra solo esos")
+    L.append("- `cleanup-agent --apply-safe` → todo lo seguro")
+    L.append("- añade `--dry-run` para simular")
+    L.append("")
+    L.append("## 🟡 Revisar (se puede borrar con confirmación)")
+    L.append("")
+    L.append("| Qué | Tamaño | ¿Se puede borrar? | Riesgo |")
+    L.append("|---|---:|---|---|")
+    if medium:
+        for m in medium[:25]:
+            inf = explain_item(m)
+            L.append("| %s %s | %s | %s | %s |" % (inf["emoji"], m["name"], human(m["bytes"]),
+                                                   inf["verdict"], inf["risk_text"]))
+    else:
+        L.append("| — | — | — | — |")
+    L.append("")
+    L.append("## 🔴 Protegido (solo lectura, nunca se borra)")
+    L.append("")
+    L.append("| Qué | Tamaño | ¿Se puede borrar? |")
+    L.append("|---|---:|---|")
+    for r in risky:
+        L.append("| %s | %s | ⛔ No |" % (r["name"], human(r["bytes"])))
+    L.append("")
+    L.append("## 🧾 Detalle de Revisar")
+    L.append("")
+    for m in medium:
+        inf = explain_item(m)
+        L.append("### %s %s — %s" % (inf["emoji"], m["name"], human(m["bytes"])))
+        L.append("")
+        L.append("- **¿Se puede borrar?** %s · riesgo: %s" % (inf["verdict"], inf["risk_text"]))
+        if inf["specific"]:
+            L.append("- **Detalle:** %s" % inf["specific"])
+        L.append("- **Se borra:** %s" % inf["deletes"])
+        L.append("- **No se borra:** %s" % inf["keeps"])
+        L.append("- **Impacto:** %s" % inf["impact"])
+        L.append("")
+    L.append("## 🧾 Detalle de Protegido")
+    L.append("")
+    for r in risky:
+        inf = explain_item(r)
+        L.append("### %s %s — %s" % (inf["emoji"], inf["title"], human(r["bytes"])))
+        L.append("")
+        L.append("- **⛔ No se puede borrar desde el agente.**")
+        L.append("- **Qué es:** %s" % inf["what"])
+        if inf["specific"]:
+            L.append("- **Detalle:** %s" % inf["specific"])
+        L.append("- **Contiene:** %s" % inf["deletes"])
+        L.append("- **Se conserva:** %s" % inf["keeps"])
+        L.append("")
+    if snaps:
+        L.append("## 💾 Snapshots locales")
+        L.append("")
+        for s in snaps:
+            L.append("- `%s`" % s)
+        L.append("")
+    ql = quarantine_list()
+    if ql:
+        L.append("## 🗂 Cuarentena (%d)" % len(ql))
+        L.append("")
+        for e in ql:
+            L.append("- `%s` — %s · %s · %d días → `%s`" %
+                     (e["id"], e.get("name"), human(e.get("bytes", 0)),
+                      e.get("days_left", 0), e.get("original_path")))
+        L.append("")
+    L.append("---")
+    L.append("_cleanup-agent no borra nada por sí solo. Solo borra cuando tú eliges._")
+    return "\n".join(L)
+
+
+def write_report(text):
+    now = datetime.datetime.now()
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    latest = os.path.join(REPORT_DIR, "report-latest.md")
+    dated = os.path.join(REPORT_DIR, "report-%s.md" % now.strftime("%Y-%m-%d"))
+    for p in (latest, dated):
+        with open(p, "w") as f:
+            f.write(text + "\n")
+    return latest
+
+
+# ------------------------------------------------------------------ selection
+
+def parse_selection(text, safe):
+    n = len(safe)
+    text = text.strip().lower()
+    if text in ("", "n", "no", "ninguno", "none"):
+        return []
+    if text in ("todos", "all", "*"):
+        return list(range(n))
+    picked = set()
+    for part in re.split(r"[,\s]+", text):
+        if not part:
+            continue
+        m = re.match(r"s?(\d+)(?:-s?(\d+))?$", part)
+        if not m:
+            continue
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else a
+        for k in range(a, b + 1):
+            if 1 <= k <= n:
+                picked.add(k - 1)
+    return sorted(picked)
+
+
+def print_items(items):
+    for s in items:
+        print("  %-4s %-45s %10s" % (s.get("id", ""),
+                                     (icon_for(s["name"]) + " " + s["name"])[:45],
+                                     human(s.get("bytes", 0))))
+
+
+def apply_items(items, yes=False, dry_run=False, thin=False, quarantine=True, force_open=False):
+    empty = {"freed": 0, "deleted": 0, "quarantined": 0, "quarantined_items": [],
+             "skipped": [], "errors": []}
+    items = [i for i in items if (i.get("bytes", 0) > 0 or i.get("kind") == "brew")]
+    if not items:
+        print("No hay nada que borrar en la selección.")
+        return empty
+    total = sum(i.get("bytes", 0) for i in items)
+    print("\nSeleccionado: %d items, %s\n" % (len(items), human(total)))
+    print_items(items)
+    if dry_run:
+        print("\n🔎 DRY-RUN: no se borró nada.")
+        return empty
+    if not yes:
+        try:
+            ans = input("\n¿Procesar estos %d items (%s)? [s/N] " % (len(items), human(total))).strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans not in ("s", "si", "sí", "y", "yes"):
+            print("Cancelado.")
+            return empty
+    quarantine_autopurge()
+    log("apply start: %d items, %s" % (len(items), human(total)))
+    free_before = disk_info()["free"]
+    freed = 0
+    deleted = 0
+    qbytes = 0
+    skipped = []
+    skipped_items = []
+    errors = []
+    qitems = []
+    for i in items:
+        try:
+            if i.get("kind") == "brew":
+                print("🍺 Homebrew cleanup…")
+                run(["/opt/homebrew/bin/brew", "cleanup", "-s"], timeout=600)
+                log("brew cleanup -s")
+                continue
+            path = i.get("path") or ""
+            ok, reason = validate_item(i, force_open=force_open)
+            if not ok:
+                skipped.append((i.get("name", "?"), reason))
+                if reason.startswith("app abierta"):
+                    skipped_items.append(i)
+                print("  ⏭  %s (%s)" % (i.get("name", "?"), reason))
+                log("skip %s: %s" % (path, reason))
+                continue
+            if quarantine and should_quarantine(i):
+                eid = quarantine_add(i)
+                if eid:
+                    qbytes += i.get("bytes", 0)
+                    qitems.append({"id": eid, "name": i.get("name", "?"),
+                                   "bytes": i.get("bytes", 0)})
+                    print("  📦 %s → cuarentena" % i.get("name", "?"))
+                else:
+                    errors.append((i.get("name", "?"), "no se pudo mover a cuarentena"))
+                continue
+            if i.get("kind") == "file" or os.path.isfile(path):
+                os.remove(path)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+            freed += i.get("bytes", 0)
+            deleted += 1
+            print("  ✅ %s" % i.get("name", "?"))
+            log("deleted %s (%s)" % (path, human(i.get("bytes", 0))))
+        except Exception as e:
+            errors.append((i.get("name", "?"), str(e)))
+            print("  ⚠️  %s: %s" % (i.get("name", "?"), e))
+            log("error deleting %s: %s" % (i.get("path", "?"), e))
+    if not dry_run and thin and freed > 0:
+        free_after = disk_info()["free"]
+        if (free_after - free_before) < freed * 0.5 and tm_snapshots():
+            log("espacio retenido por snapshots; purgando")
+            thin_snapshots()
+    print("\n🎉 Listo.")
+    if freed:
+        print("   Borrado permanente: %s" % human(freed))
+    if qbytes:
+        print("   En cuarentena: %s (recuperable %d días)" % (human(qbytes), QUARANTINE_DAYS))
+    if skipped:
+        print("   Omitidos: %d" % len(skipped))
+    if errors:
+        print("   Errores: %d" % len(errors))
+    log("apply done: %d deleted, freed ~%s, quarantined ~%s, skipped %d, errors %d" %
+        (deleted, human(freed), human(qbytes), len(skipped), len(errors)))
+    return {"freed": freed, "deleted": deleted, "quarantined": qbytes,
+            "quarantined_items": qitems, "skipped": skipped,
+            "skipped_items": skipped_items, "errors": errors}
+
+
+def choose_interactive(safe, dry_run=False):
+    if not safe:
+        print("No hay nada seguro.")
+        return
+    print("\n🟢 SEGURO — elige qué borrar\n")
+    print_items(safe)
+    ans = input("\nIDs (ej: S1,S4-S6) · 'todos' · Enter=salir: ")
+    sel = parse_selection(ans, safe)
+    if not sel:
+        print("Nada seleccionado.")
+        return
+    apply_items([safe[i] for i in sel], yes=False, dry_run=dry_run, thin=True)
+
+
+# ------------------------------------------------------------------ notify
+
+def load_config():
+    defaults = {"notify": {"macos": True,
+                           "telegram": {"enabled": True, "bot_token": "", "chat_id": ""}}}
+    if not os.path.exists(CONFIG_PATH):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(defaults, f, indent=2)
+        os.chmod(CONFIG_PATH, 0o600)
+        return defaults
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        cfg.setdefault("notify", {})
+        cfg["notify"].setdefault("macos", True)
+        cfg["notify"].setdefault("telegram", {"enabled": True, "bot_token": "", "chat_id": ""})
+        return cfg
+    except Exception:
+        return defaults
+
+
+def keychain_get(account, service="cleanup-agent-telegram"):
+    try:
+        p = subprocess.run(["/usr/bin/security", "find-generic-password",
+                            "-a", account, "-s", service, "-w"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        if p.returncode == 0:
+            return p.stdout.decode("utf-8", "replace").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def telegram_send(text, parse_mode="HTML"):
+    try:
+        import urllib.parse
+        import urllib.request
+        cfg = load_config()["notify"]["telegram"]
+        token = cfg.get("bot_token") or keychain_get("bot_token")
+        chat = cfg.get("chat_id") or keychain_get("chat_id")
+        if not cfg.get("enabled") or not token or not chat:
+            return False
+        data = {"chat_id": chat, "text": text}
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+        url = "https://api.telegram.org/bot%s/sendMessage" % token
+        body = urllib.parse.urlencode(data).encode()
+        urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=25).read()
+        return True
+    except Exception as e:
+        log("telegram error: %s" % e)
+        return False
+
+
+def notify(safe, medium, risky, report_path):
+    t_safe = sum(i["bytes"] for i in safe)
+    t_med = sum(i["bytes"] for i in medium)
+    t_risk = sum(i["bytes"] for i in risky)
+    d = disk_info()
+    mi = machine_info()
+    pct = int(round(100.0 * d["used"] / d["total"])) if d["total"] else 0
+    lines = ["🤖🧹 <b>cleanup-agent</b>",
+             "<i>%s · %s</i>" % (html.escape(mi["name"]), html.escape(mi["model"])),
+             "",
+             "💽 <b>Disco</b>  %s <b>%d%%</b>" % (bar(pct), pct),
+             "Libre: <b>%s</b> de %s" % (human(d["free"]), human(d["total"])),
+             "",
+             "🟢 Seguro: <b>%s</b>" % human(t_safe),
+             "🟡 Revisar: %s" % human(t_med),
+             "♻️ Potencial: <b>%s</b>" % human(t_safe + t_med),
+             "🔴 Protegido: %s" % human(t_risk), ""]
+    if safe:
+        lines.append("<b>Top para borrar</b>")
+        for s in safe[:5]:
+            lines.append("• %s %s — %s" % (icon_for(s["name"]), html.escape(s["name"]), human(s["bytes"])))
+        lines.append("")
+    lines.append("Abre el bot y usa /limpiar para elegir.")
+    msg = "\n".join(lines)
+    cfg = load_config()
+    if cfg["notify"].get("macos", True):
+        run(["/usr/bin/osascript", "-e",
+             'display notification "%s" with title "Cleanup Agent" subtitle "Toca: cleanup-agent --choose"'
+             % ("Seguro: " + human(t_safe))], timeout=20)
+    telegram_send(msg)
+
+
+# ------------------------------------------------------------------ main
+
+def main():
+    ap = argparse.ArgumentParser(description="Audita y limpia lo seguro de macOS.")
+    ap.add_argument("--report", action="store_true")
+    ap.add_argument("--apply-safe", action="store_true")
+    ap.add_argument("--choose", action="store_true", help="menú interactivo de IDs")
+    ap.add_argument("--pick", help="IDs a borrar, ej: S1,S4-S6")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--notify", action="store_true")
+    ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quarantine-list", action="store_true")
+    ap.add_argument("--restore", help="ID de cuarentena a restaurar")
+    ap.add_argument("--purge-quarantine", action="store_true")
+    ap.add_argument("--excludes", action="store_true")
+    ap.add_argument("--add-exclude", help="añadir ruta a exclusiones")
+    args = ap.parse_args()
+
+    if args.quarantine_list:
+        ql = quarantine_list()
+        if not ql:
+            print("Cuarentena vacía.")
+        for e in ql:
+            print("%s  %8s  %-30s  %d días  -> %s" %
+                  (e["id"], human(e.get("bytes", 0)), e.get("name"),
+                   e.get("days_left", 0), e.get("original_path")))
+        return
+    if args.restore:
+        ok, msg = quarantine_restore(args.restore)
+        print(("✅ Restaurado: " if ok else "⚠️  ") + msg)
+        return
+    if args.purge_quarantine:
+        n, f = quarantine_purge()
+        print("Purgados %d entries, liberado ≈ %s" % (n, human(f)))
+        return
+    if args.excludes:
+        print("\n".join(load_excludes()))
+        return
+    if args.add_exclude:
+        add_exclude(args.add_exclude)
+        print("Añadido a exclusiones: %s" % args.add_exclude)
+        return
+
+    safe, medium, risky, snaps = gather()
+
+    if args.apply_safe:
+        apply_items(safe, yes=args.yes, dry_run=args.dry_run, thin=True)
+        return
+    if args.choose:
+        choose_interactive(safe, dry_run=args.dry_run)
+        return
+    if args.pick:
+        sel = parse_selection(args.pick, safe)
+        if not sel:
+            print("IDs inválidos o vacíos. Usa por ejemplo: --pick S1,S4-S6")
+            return
+        apply_items([safe[i] for i in sel], yes=args.yes, dry_run=args.dry_run, thin=True)
+        return
+
+    text = report_text(safe, medium, risky, snaps)
+    path = write_report(text)
+    if args.json:
+        print(json.dumps({"safe": safe, "medium": medium, "risky": risky,
+                          "snapshots": snaps}, indent=2))
+    else:
+        print(text)
+    if args.notify:
+        notify(safe, medium, risky, path)
+    log("report: safe=%s medium=%s risky=%s snaps=%d" %
+        (human(sum(i["bytes"] for i in safe)), human(sum(i["bytes"] for i in medium)),
+         human(sum(i["bytes"] for i in risky)), len(snaps)))
+
+
+if __name__ == "__main__":
+    main()

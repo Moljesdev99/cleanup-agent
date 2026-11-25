@@ -1,0 +1,5 @@
+# Paths cleanup-agent will NEVER touch (one per line, supports ~ and *)
+~/Documents
+~/Desktop
+~/.ssh
+~/Library/Mobile Documents

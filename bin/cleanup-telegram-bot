@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""Bot de Telegram de cleanup-agent.
+
+Flujo:
+  /report  -> resumen con botones:
+              🧹 Borrar todo lo seguro (1 toque)
+              🟡 Revisar  /  🔴 Protegido  (elegir con checkboxes)
+  /limpiar -> selector de grupo
+  /status  -> disco
+"""
+
+import html
+import json
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+from importlib.machinery import SourceFileLoader
+
+CA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleanup-agent")
+CA = SourceFileLoader("ca", CA_PATH).load_module()
+
+OFFSET = 0
+STATE = {}
+RETRY = {}
+PAGE = 8
+esc = html.escape
+PENDING_PATH = os.path.join(CA.LOG_DIR, "pending-delete.json")
+
+APP_QUIT = {
+    "coast local": "Coast Local", "cap.app": "Cap", "steam": "Steam",
+    "discord": "Discord", "notion": "Notion", "opera": "Opera",
+    "aside": "Aside", "granola": "Granola", "raycast": "Raycast",
+}
+
+GROUP_META = {
+    "safe": ("🟢", "Seguro", "Solo cachés y temporales. No toca documentos, fotos, chats ni sesiones."),
+    "medium": ("🟡", "Revisar", "No es caché: puede ser un archivo o instalador tuyo. Revísalo antes."),
+    "risky": ("🔴", "Protegido", "Datos personales o de apps. Bórralos solo si sabes lo que haces."),
+}
+
+
+def creds():
+    return CA.keychain_get("bot_token"), CA.keychain_get("chat_id")
+
+
+def api(token, method, **params):
+    data = urllib.parse.urlencode(params).encode()
+    url = "https://api.telegram.org/bot%s/%s" % (token, method)
+    with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=75) as r:
+        return json.load(r)
+
+
+def send(token, chat, text, markup=None):
+    p = {"chat_id": chat, "text": text, "parse_mode": "HTML",
+         "disable_web_page_preview": "true"}
+    if markup is not None:
+        p["reply_markup"] = json.dumps(markup)
+    return api(token, "sendMessage", **p)
+
+
+def edit(token, chat, mid, text, markup=None):
+    p = {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML"}
+    if markup is not None:
+        p["reply_markup"] = json.dumps(markup)
+    try:
+        return api(token, "editMessageText", **p)
+    except Exception:
+        return None
+
+
+def short(name, n=12):
+    for pre in ("Cache: ", "~/.cache: ", "Logs: ", "Updater: ", "Archivo grande: "):
+        if name.startswith(pre):
+            name = name[len(pre):]
+    return name[:n]
+
+
+def confirm_kb(risky=False):
+    if risky:
+        return {"inline_keyboard": [[
+            {"text": "⚠️ Sí, borrar", "callback_data": "confirm2"},
+            {"text": "❌ Cancelar", "callback_data": "cancel"}]]}
+    return {"inline_keyboard": [[
+        {"text": "✅ Confirmar", "callback_data": "confirm"},
+        {"text": "❌ Cancelar", "callback_data": "cancel"}]]}
+
+
+# ------------------------------------------------------------------ vistas
+
+def report_view():
+    safe, medium, risky, snaps = CA.gather()
+    d = CA.disk_info()
+    mi = CA.machine_info()
+    pct = int(round(100.0 * d["used"] / d["total"])) if d["total"] else 0
+    t_safe = sum(i["bytes"] for i in safe)
+    t_med = sum(i["bytes"] for i in medium)
+    t_risk = sum(i["bytes"] for i in risky)
+    L = ["🤖🧹 <b>cleanup-agent</b>",
+         "<i>%s · %s (%s) · %s</i>" % (esc(mi["name"]), esc(mi["model"]), esc(mi["model_id"]), esc(mi["chip"])),
+         "",
+         "💽 <b>Disco</b>   %s <b>%d%%</b>" % (CA.bar(pct), pct),
+         "Libre <b>%s</b> de %s" % (CA.human(d["free"]), CA.human(d["total"])),
+         "",
+         "🟢 Seguro   <b>%s</b>" % CA.human(t_safe),
+         "🟡 Revisar   %s" % CA.human(t_med),
+         "♻️ Potencial   <b>%s</b>" % CA.human(t_safe + t_med),
+         "🔴 Protegido   %s" % CA.human(t_risk),
+         "",
+         "🏆 <b>Qué ocupa más</b>"]
+    for size, p in CA.top_consumers(5):
+        nm = CA.display_name(p)
+        info = CA.APP_INFO.get(nm, "")
+        L.append("%s <b>%s</b> — %s%s" % (CA.icon_for(nm), esc(nm), CA.human(size),
+                                         (" · <i>%s</i>" % esc(info)) if info else ""))
+    return "\n".join(L), safe
+
+
+def report_kb():
+    return {"inline_keyboard": [
+        [{"text": "🧹 Borrar todo lo seguro", "callback_data": "wipe_safe"}],
+        [{"text": "🟡 Revisar", "callback_data": "group:medium"},
+         {"text": "🔴 Protegido", "callback_data": "group:risky"}],
+        [{"text": "💽 Disco", "callback_data": "disk"},
+         {"text": "🧾 Detalle", "callback_data": "details"}],
+        [{"text": "ℹ️ Qué significa", "callback_data": "help"}]]}
+
+
+def help_text():
+    return ("ℹ️ <b>Qué significa cada nivel</b>\n\n"
+            "🟢 <b>Seguro</b> — cachés y temporales que las apps regeneran. No afecta tus datos.\n\n"
+            "🟡 <b>Revisar</b> — no es caché; puede ser un archivo o instalador tuyo.\n\n"
+            "🔴 <b>Protegido</b> — datos personales o de apps. Nunca se borra solo.\n\n"
+            "ℹ️ Los <b>cachés</b> se borran aunque la app esté abierta; los <b>juegos/grabaciones</b> se omiten si la app está abierta.\n\n"
+            "🗂 <b>Cuarentena</b> — lo de 🟡 se mueve ahí 7 días. /cuarentena para restaurar, /vaciar para borrar.\n\n"
+            "🚫 <b>Exclusiones</b> — /excluir ruta · /exclusiones\n\n"
+            "<i>Nada se borra sin tu confirmación.</i>")
+
+
+def details_text():
+    safe = CA.scan_safe()
+    safe.sort(key=lambda x: -x["bytes"])
+    groups = CA.group_safe(safe)
+    L = ["🧾 <b>Qué se borra exactamente</b>", "",
+         "<i>Solo lo 🟢 Seguro. Tus documentos, fotos y chats no se tocan.</i>"]
+    for g in groups:
+        path = g["paths"][0] if g["paths"] else ""
+        extra = " (+%d rutas)" % (len(g["paths"]) - 1) if len(g["paths"]) > 1 else ""
+        L += ["", "%s <b>%s</b> — %s" % (g["emoji"], esc(g["title"]), CA.human(g["bytes"])),
+              "<blockquote><b>Se borra:</b> %s\n<b>Ruta:</b> <code>%s</code>%s\n"
+              "<b>No se borra:</b> %s\n<b>Impacto:</b> %s</blockquote>"
+              % (esc(g["deletes"]), esc(path), esc(extra), esc(g["keeps"]), esc(g["impact"]))]
+    return "\n".join(L)
+
+
+def send_long(token, chat, text):
+    limit = 3500
+    while len(text) > limit:
+        cut = text.rfind("\n\n", 0, limit)
+        if cut < 1000:
+            cut = limit
+        send(token, chat, text[:cut])
+        text = text[cut:].lstrip()
+    send(token, chat, text)
+
+
+def send_long_markup(token, chat, text, markup):
+    limit = 3500
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n\n", 0, limit)
+        if cut < 1000:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip()
+    parts.append(text)
+    for i, p in enumerate(parts):
+        send(token, chat, p, markup if i == len(parts) - 1 else None)
+
+
+def disk_text():
+    d = CA.disk_info()
+    mi = CA.machine_info()
+    pct = int(round(100.0 * d["used"] / d["total"])) if d["total"] else 0
+    L = ["💽 <b>Disco</b>",
+         "<i>%s · %s (%s)</i>" % (esc(mi["name"]), esc(mi["model"]), esc(mi["model_id"])),
+         "",
+         "%s <b>%d%%</b>" % (CA.bar(pct), pct),
+         "🟠 Usado <b>%s</b>" % CA.human(d["used"]),
+         "🟢 Libre <b>%s</b>" % CA.human(d["free"]),
+         "⚪ Total %s" % CA.human(d["total"]),
+         "",
+         "📊 <b>En qué se usa (%s)</b>" % CA.human(d["used"])]
+    for it in CA.disk_breakdown():
+        L.append("%s %s — %s" % (it["emoji"], esc(it["name"]), CA.human(it["bytes"])))
+    tops = CA.top_subdirs(os.path.join(os.path.expanduser("~"), "Library", "Application Support"), 5)
+    if tops:
+        L += ["", "🏆 <b>Dentro de Datos de apps</b>"]
+        for size, p in tops:
+            nm = CA.display_name(p)
+            L.append("%s %s — %s" % (CA.icon_for(nm), esc(nm), CA.human(size)))
+    return "\n".join(L)
+
+
+# ------------------------------------------------------------------ menú por grupo
+
+def group_items(group):
+    if group == "safe":
+        items = CA.scan_safe()
+    elif group == "medium":
+        items = CA.scan_medium()
+    else:
+        items = CA.scan_risky()
+    items.sort(key=lambda x: -x["bytes"])
+    return items
+
+
+def menu_text(st):
+    emoji, title, note = GROUP_META[st["group"]]
+    total = sum(st["items"][i]["bytes"] for i in st["selected"])
+    L = ["%s <b>%s</b>" % (emoji, title), "", "<i>%s</i>" % esc(note), "",
+         "Seleccionado <b>%d</b> · <b>%s</b>" % (len(st["selected"]), CA.human(total))]
+    last = st.get("last")
+    if last is not None and 0 <= last < len(st["items"]):
+        info = CA.explain_item(st["items"][last])
+        b = ["%s <b>%s</b> · %s" % (info["emoji"], esc(info["title"]), info["size"]),
+             "<b>¿Se puede borrar?</b> %s" % esc(info["verdict"]),
+             "<b>Riesgo:</b> %s" % esc(info["risk_text"]),
+             "<b>Qué es:</b> %s" % esc(info["what"])]
+        if info.get("specific"):
+            b.append("<b>Detalle:</b> %s" % esc(info["specific"]))
+        b += ["<b>Se borra:</b> %s" % esc(info["deletes"]),
+              "<b>Ruta:</b> <code>%s</code>" % esc(info["path"]),
+              "<b>No se borra:</b> %s" % esc(info["keeps"]),
+              "<b>Impacto:</b> %s" % esc(info["impact"])]
+        L += ["", "<blockquote>%s</blockquote>" % "\n".join(b)]
+    else:
+        L += ["", "<i>Toca una opción para ver exactamente qué se borra.</i>"]
+    return "\n".join(L)
+
+
+def menu_kb(st):
+    items = st["items"]
+    page = st["page"]
+    start, end = page * PAGE, min((page + 1) * PAGE, len(items))
+    rows, row = [], []
+    for idx in range(start, end):
+        it = items[idx]
+        mark = "✅" if idx in st["selected"] else "☐"
+        e, _, _ = CA.describe(it["name"])
+        row.append({"text": "%s %s %s · %s" % (mark, e, short(it["name"]), CA.human(it["bytes"])),
+                    "callback_data": "t:%d" % idx})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    npages = max(1, (len(items) + PAGE - 1) // PAGE)
+    rows.append([{"text": "⬅️", "callback_data": "p:prev"},
+                 {"text": "%d/%d" % (page + 1, npages), "callback_data": "noop"},
+                 {"text": "➡️", "callback_data": "p:next"}])
+    rows.append([{"text": "ℹ️ Qué es esto", "callback_data": "explain"}])
+    rows.append([{"text": "☑️ Todo", "callback_data": "all"},
+                 {"text": "🗑 Borrar (%d)" % len(st["selected"]), "callback_data": "apply"}])
+    rows.append([{"text": "❌ Cancelar", "callback_data": "cancel"}])
+    return {"inline_keyboard": rows}
+
+
+def explain_page(st):
+    start = st["page"] * PAGE
+    end = min(start + PAGE, len(st["items"]))
+    seen, L = set(), ["ℹ️ <b>Qué es esto</b>"]
+    for idx in range(start, end):
+        e, t, d = CA.describe(st["items"][idx]["name"])
+        if t in seen:
+            continue
+        seen.add(t)
+        L += ["", "%s <b>%s</b>\n<blockquote>%s</blockquote>" % (e, esc(t), esc(d))]
+    return "\n".join(L)
+
+
+def show_protected(token, chat):
+    items = group_items("risky")
+    L = ["🔴 <b>Protegido</b>", "",
+         "<i>Estos datos nunca se borran desde el agente. Solo se informan.</i>"]
+    for it in items:
+        info = CA.explain_item(it)
+        L.append("")
+        L.append("%s <b>%s</b> — %s" % (info["emoji"], esc(info["title"]), info["size"]))
+        b = ["⛔ <b>No se puede borrar desde el agente.</b>",
+             "<b>Qué es:</b> %s" % esc(info["what"])]
+        if info.get("specific"):
+            b.append("<b>Detalle:</b> %s" % esc(info["specific"]))
+        b.append("<b>Contiene:</b> %s" % esc(info["deletes"]))
+        b.append("<b>Se conserva:</b> %s" % esc(info["keeps"]))
+        L.append("<blockquote>%s</blockquote>" % "\n".join(b))
+    if len(L) == 3:
+        L.append("")
+        L.append("Nada por aquí.")
+    send_long_markup(token, chat, "\n".join(L),
+                     {"inline_keyboard": [[{"text": "💽 Disco", "callback_data": "disk"},
+                                           {"text": "🔙 Volver", "callback_data": "r"}]]})
+
+
+def start_menu(token, chat, group="safe"):
+    if group == "risky":
+        show_protected(token, chat)
+        return
+    items = group_items(group)
+    if not items:
+        if group == "medium":
+            send(token, chat,
+                 "🟡 <b>Revisar</b>\n\nNo hay nada para revisar ahora.\n"
+                 "<i>Aquí aparecen instaladores y archivos grandes. Si esperabas ver algo en "
+                 "Música o Fotos, macOS puede estar bloqueando el acceso (Acceso Total al Disco).</i>",
+                 {"inline_keyboard": [[{"text": "🔙 Volver", "callback_data": "r"}]]})
+        else:
+            send(token, chat, "🎉 No hay nada en este grupo.")
+        return
+    STATE[chat] = {"group": group, "items": items, "selected": set(), "page": 0}
+    send(token, chat, menu_text(STATE[chat]), menu_kb(STATE[chat]))
+
+
+def start_picker(token, chat):
+    send(token, chat, "🧹 <b>¿Qué quieres revisar?</b>",
+         {"inline_keyboard": [
+             [{"text": "🟢 Seguro", "callback_data": "group:safe"},
+              {"text": "🟡 Revisar", "callback_data": "group:medium"}],
+             [{"text": "🔴 Protegido", "callback_data": "group:risky"}]]})
+
+
+def wipe_safe(token, chat):
+    items = group_items("safe")
+    if not items:
+        send(token, chat, "🎉 No hay nada seguro que borrar.")
+        return
+    total = sum(i["bytes"] for i in items)
+    STATE[chat] = {"group": "safe", "items": items,
+                   "selected": set(range(len(items))), "page": 0, "pending": items}
+    send(token, chat, "🧹 <b>Borrar todo lo seguro</b>\n\n%d items · <b>%s</b>"
+         % (len(items), CA.human(total)), confirm_kb(False))
+
+
+def quit_apps(apps):
+    if not apps:
+        return
+    for a in apps:
+        CA.run(["/usr/bin/osascript", "-e", 'tell application "%s" to quit' % APP_QUIT.get(a, a)], timeout=15)
+    time.sleep(4)
+    for a in apps:
+        CA.run(["/usr/bin/pkill", "-TERM", "-f", APP_QUIT.get(a, a)], timeout=10)
+    time.sleep(2)
+
+
+def show_quarantine(token, chat):
+    ql = CA.quarantine_list()
+    if not ql:
+        send(token, chat, "🗂 La cuarentena está vacía.")
+        return
+    L = ["🗂 <b>Cuarentena</b>", "", "<i>Restaura o vacía antes de 7 días.</i>"]
+    rows = []
+    for i, e in enumerate(ql[:10], 1):
+        L += ["", "%s <b>%s</b> — %s · %d días" %
+              (CA.icon_for(e.get("name", "")), esc(e.get("name") or "?"),
+               CA.human(e.get("bytes", 0)), e.get("days_left", 0)),
+              "<code>%s</code>" % esc(e.get("original_path", ""))]
+        rows.append([{"text": "↩️ Restaurar %d" % i, "callback_data": "qr:%s" % e["id"]},
+                     {"text": "🗑 Purgar %d" % i, "callback_data": "qp:%s" % e["id"]}])
+    if len(ql) > 10:
+        L += ["", "… y %d más" % (len(ql) - 10)]
+    rows.append([{"text": "💥 Vaciar toda", "callback_data": "qpall"},
+                 {"text": "🔙 Volver", "callback_data": "r"}])
+    send_long_markup(token, chat, "\n".join(L), {"inline_keyboard": rows})
+
+
+# ------------------------------------------------------------------ callbacks
+
+def handle_callback(token, chat, cb):
+    data = cb.get("data", "")
+    msg = cb.get("message") or {}
+    mid = msg.get("message_id")
+    if int(msg.get("chat", {}).get("id", 0)) != int(chat):
+        return
+    try:
+        api(token, "answerCallbackQuery", callback_query_id=cb["id"])
+    except Exception:
+        pass
+
+    if data == "r":
+        text, _ = report_view()
+        edit(token, chat, mid, text, report_kb())
+        return
+    if data == "disk":
+        edit(token, chat, mid, disk_text(), report_kb())
+        return
+    if data == "help":
+        send(token, chat, help_text(),
+             {"inline_keyboard": [[{"text": "🔙 Volver", "callback_data": "r"}]]})
+        return
+    if data == "details":
+        send_long(token, chat, details_text())
+        return
+    if data == "wipe_safe":
+        wipe_safe(token, chat)
+        return
+    if data.startswith("group:"):
+        start_menu(token, chat, data.split(":", 1)[1])
+        return
+    if data == "cancel":
+        STATE.pop(chat, None)
+        send(token, chat, "❌ <b>Cancelado</b>")
+        return
+    if data == "qlist":
+        show_quarantine(token, chat)
+        return
+    if data.startswith("qr:"):
+        ok, msg = CA.quarantine_restore(data[3:])
+        send(token, chat, ("✅ Restaurado: <code>%s</code>" % esc(msg)) if ok else ("⚠️ %s" % esc(msg)))
+        return
+    if data.startswith("qp:"):
+        n, f = CA.quarantine_purge(data[3:])
+        send(token, chat, "🗑 Purgado. Liberado ≈ <b>%s</b>" % CA.human(f))
+        return
+    if data == "qpall":
+        ql = CA.quarantine_list()
+        if not ql:
+            send(token, chat, "La cuarentena está vacía.")
+            return
+        total = sum(e.get("bytes", 0) for e in ql)
+        send(token, chat, "⚠️ ¿Vaciar TODA la cuarentena (%d items, %s)?" % (len(ql), CA.human(total)),
+             {"inline_keyboard": [[{"text": "✅ Sí, vaciar", "callback_data": "qpall_yes"},
+                                   {"text": "❌ Cancelar", "callback_data": "cancel"}]]})
+        return
+    if data == "qpall_yes":
+        n, f = CA.quarantine_purge()
+        send(token, chat, "💥 Cuarentena vaciada: %d items, liberado ≈ <b>%s</b>" % (n, CA.human(f)))
+        return
+    if data == "retry_open":
+        items = RETRY.get(chat) or []
+        if not items:
+            send(token, chat, "No hay nada pendiente.")
+            return
+        apps = sorted(set(filter(None, (CA.app_for_path(i.get("path") or "") for i in items))))
+        names = ", ".join(APP_QUIT.get(a, a) for a in apps)
+        send(token, chat, "🔁 Se cerrará <b>%s</b> y se reintentará el borrado. ¿Continuar?" % esc(names),
+             {"inline_keyboard": [[{"text": "✅ Cerrar y borrar", "callback_data": "retry_confirm"},
+                                   {"text": "❌ Cancelar", "callback_data": "cancel"}]]})
+        return
+    if data == "retry_confirm":
+        items = RETRY.get(chat) or []
+        if not items:
+            send(token, chat, "No hay nada pendiente.")
+            return
+        apps = sorted(set(filter(None, (CA.app_for_path(i.get("path") or "") for i in items))))
+        names = ", ".join(APP_QUIT.get(a, a) for a in apps)
+        send(token, chat, "⏳ Cerrando %s…" % esc(names))
+        quit_apps(apps)
+        res = CA.apply_items(items, yes=True, quarantine=True, thin=True)
+        if "coast local" in apps:
+            CA.run(["/usr/bin/open", "-a", "Coast Local"], timeout=15)
+        RETRY.pop(chat, None)
+        freed = res.get("freed", 0)
+        qb = res.get("quarantined", 0)
+        sk = res.get("skipped", [])
+        msg = "🎉 <b>Listo</b>\n"
+        if freed:
+            msg += "🗑 Permanente: <b>%s</b>\n" % CA.human(freed)
+        if qb:
+            msg += "🗂 Cuarentena: <b>%s</b> (usa /vaciar para liberar)\n" % CA.human(qb)
+        if sk:
+            msg += "⏭ Aún omitidos: %d\n" % len(sk)
+        kb = None
+        if qb:
+            kb = {"inline_keyboard": [[{"text": "🗂 Ver cuarentena", "callback_data": "qlist"},
+                                       {"text": "💥 Vaciar", "callback_data": "qpall"}]]}
+        send(token, chat, msg, kb)
+        return
+
+    st = STATE.get(chat)
+    if not st:
+        send(token, chat, "Primero abre /limpiar.")
+        return
+    if data == "explain":
+        send(token, chat, explain_page(st))
+        return
+    if data == "noop":
+        return
+    if data == "cancel":
+        STATE.pop(chat, None)
+        edit(token, chat, mid, "❌ <b>Cancelado</b>")
+        return
+    if data.startswith("p:"):
+        npages = max(1, (len(st["items"]) + PAGE - 1) // PAGE)
+        if data == "p:next":
+            st["page"] = min(npages - 1, st["page"] + 1)
+        elif data == "p:prev":
+            st["page"] = max(0, st["page"] - 1)
+        edit(token, chat, mid, menu_text(st), menu_kb(st))
+        return
+    if data.startswith("t:"):
+        idx = int(data.split(":", 1)[1])
+        if idx in st["selected"]:
+            st["selected"].discard(idx)
+        else:
+            st["selected"].add(idx)
+        st["last"] = idx
+        edit(token, chat, mid, menu_text(st), menu_kb(st))
+        return
+    if data == "all":
+        if st["group"] == "risky":
+            return
+        if len(st["selected"]) == len(st["items"]):
+            st["selected"] = set()
+        else:
+            st["selected"] = set(range(len(st["items"])))
+        edit(token, chat, mid, menu_text(st), menu_kb(st))
+        return
+    if data == "apply":
+        if not st["selected"]:
+            send(token, chat, "⚠️ No has seleccionado nada.")
+            return
+        items = [st["items"][i] for i in sorted(st["selected"])]
+        st["pending"] = items
+        total = sum(i["bytes"] for i in items)
+        open_items = [i for i in items if i.get("risk") != CA.SAFE
+                      and CA.app_running(i.get("path") or "")[0]
+                      and not CA.allow_open_delete(i.get("path") or "")]
+        if open_items:
+            procs = sorted(set(CA.app_running(i.get("path") or "")[1] for i in open_items))
+            names = ", ".join(APP_QUIT.get(p, p) for p in procs if p)
+            edit(token, chat, mid,
+                 "⚠️ <b>App abierta</b>\n\n<b>%s</b> está abierto. Borrar sus datos ahora puede corromperlos.\n\n"
+                 "¿Continuar de todos modos?\n\n%d items · <b>%s</b>"
+                 % (esc(names), len(items), CA.human(total)),
+                 {"inline_keyboard": [
+                     [{"text": "🗂 A cuarentena", "callback_data": "force_confirm"},
+                      {"text": "💥 Permanente", "callback_data": "force_permanent"}],
+                     [{"text": "❌ Cancelar", "callback_data": "cancel"}]]})
+            return
+        if st["group"] == "medium":
+            head = ("🗂 <b>Confirmar</b>\n\n"
+                    "<i>Elige: cuarentena (recuperable %d días) o permanente.</i>\n\n" % CA.QUARANTINE_DAYS)
+            kb = {"inline_keyboard": [
+                [{"text": "🗂 A cuarentena", "callback_data": "confirm"},
+                 {"text": "💥 Permanente", "callback_data": "confirm_permanent"}],
+                [{"text": "❌ Cancelar", "callback_data": "cancel"}]]}
+        else:
+            head = "🗑 <b>Confirmar borrado</b>\n\n"
+            kb = confirm_kb(False)
+        edit(token, chat, mid, head + "%d items · <b>%s</b>" % (len(items), CA.human(total)), kb)
+        return
+    if data in ("confirm", "confirm2", "confirm_permanent", "force_confirm", "force_permanent"):
+        if data == "confirm2" and st["group"] != "risky":
+            return
+        items = st.get("pending") or []
+        if not items:
+            return
+        group = st.get("group", "")
+        force = data in ("force_confirm", "force_permanent")
+        permanent = data in ("confirm_permanent", "force_permanent")
+        STATE.pop(chat, None)
+        apps = []
+        if force:
+            apps = sorted(set(filter(None, (CA.app_for_path(i.get("path") or "") for i in items))))
+        if apps:
+            names = ", ".join(APP_QUIT.get(a, a) for a in apps)
+            edit(token, chat, mid, "⏳ Cerrando %s para liberar al instante…" % esc(names))
+            quit_apps(apps)
+        else:
+            edit(token, chat, mid, "⏳ Procesando %d items…" % len(items))
+        try:
+            os.makedirs(CA.LOG_DIR, exist_ok=True)
+            with open(PENDING_PATH, "w") as f:
+                json.dump({"chat": chat, "items": items, "group": group}, f)
+        except Exception as e:
+            CA.log("bot: no pude guardar pending: %s" % e)
+        kb = None
+        try:
+            before = CA.disk_info()["free"]
+            res = CA.apply_items(items, yes=True, dry_run=False,
+                                 thin=True, quarantine=not permanent, force_open=force)
+            if "coast local" in apps:
+                CA.run(["/usr/bin/open", "-a", "Coast Local"], timeout=15)
+            after = CA.disk_info()["free"]
+            net = after - before
+            freed = res.get("freed", 0)
+            qb = res.get("quarantined", 0)
+            qn = len(res.get("quarantined_items", []))
+            sk = res.get("skipped", [])
+            er = res.get("errors", [])
+            msg = "🎉 <b>Listo</b>\n"
+            if apps:
+                if "coast local" in apps:
+                    msg += "🔄 Cerré y reabrí Coast\n"
+                else:
+                    msg += "🔄 Cerré: %s\n" % esc(", ".join(APP_QUIT.get(a, a) for a in apps))
+            if freed:
+                msg += "🗑 Borrado permanente: <b>%s</b>\n" % CA.human(freed)
+            if qb:
+                msg += "🗂 En cuarentena: <b>%s</b> (%d items, %d días)\n" % (
+                    CA.human(qb), qn, CA.QUARANTINE_DAYS)
+            if sk:
+                msg += "⏭ Omitidos: %d\n" % len(sk)
+                for nm, rsn in sk[:5]:
+                    msg += "   · %s: %s\n" % (esc(str(nm))[:40], esc(str(rsn)))
+            if er:
+                msg += "⚠️ Errores: %d\n" % len(er)
+            msg += "Espacio libre: %s → <b>%s</b> (%s%s)" % (
+                CA.human(before), CA.human(after),
+                "＋" if net >= 0 else "−", CA.human(abs(net)))
+            buttons = []
+            if qb:
+                msg += ("\n\n<i>La cuarentena no libera espacio hasta que la vacíes (/vaciar) "
+                        "o pasen %d días.</i>" % CA.QUARANTINE_DAYS)
+                buttons.append([{"text": "🗂 Ver cuarentena", "callback_data": "qlist"},
+                                {"text": "💥 Vaciar ahora", "callback_data": "qpall"}])
+            elif freed and net < freed * 0.5:
+                msg += "\n\n<i>El espacio real puede tardar (snapshots de Time Machine).</i>"
+            retry = res.get("skipped_items", [])
+            if retry:
+                RETRY[chat] = retry
+                apps = sorted(set(filter(None, (CA.app_for_path(i.get("path") or "") for i in retry))))
+                names = ", ".join(APP_QUIT.get(a, a) for a in apps)
+                msg += "\n\n<i>%d omitido(s) por app abierta%s.</i>" % (
+                    len(retry), (": " + esc(names)) if names else "")
+                buttons.append([{"text": "🔁 Cerrar y reintentar", "callback_data": "retry_open"}])
+            if buttons:
+                kb = {"inline_keyboard": buttons}
+        except Exception as e:
+            CA.log("bot apply error: %s" % e)
+            msg = "⚠️ <b>Error al procesar</b>\n<code>%s</code>" % esc(str(e))
+        try:
+            os.remove(PENDING_PATH)
+        except Exception:
+            pass
+        send(token, chat, msg, kb)
+        return
+
+
+def handle_message(token, chat, msg):
+    text = (msg.get("text") or "").strip()
+    if text.startswith(("/start", "/report", "/reporte")):
+        t, _ = report_view()
+        send(token, chat, t, report_kb())
+        return
+    if text.startswith("/status"):
+        send(token, chat, disk_text(), report_kb())
+        return
+    if text.startswith(("/limpiar", "/choose")):
+        start_picker(token, chat)
+        return
+    if text.startswith("/seguro"):
+        wipe_safe(token, chat)
+        return
+    if text.startswith(("/cuarentena", "/restaurar")):
+        show_quarantine(token, chat)
+        return
+    if text.startswith("/vaciar"):
+        ql = CA.quarantine_list()
+        if not ql:
+            send(token, chat, "La cuarentena está vacía.")
+            return
+        total = sum(e.get("bytes", 0) for e in ql)
+        send(token, chat, "⚠️ ¿Vaciar TODA la cuarentena (%d items, %s)?" % (len(ql), CA.human(total)),
+             {"inline_keyboard": [[{"text": "✅ Sí, vaciar", "callback_data": "qpall_yes"},
+                                   {"text": "❌ Cancelar", "callback_data": "cancel"}]]})
+        return
+    if text.startswith("/exclusiones"):
+        pats = CA.load_excludes()
+        send(token, chat, "🚫 <b>Exclusiones</b>\n" +
+             "\n".join("• <code>%s</code>" % esc(p) for p in pats))
+        return
+    if text.startswith("/excluir"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            send(token, chat, "Uso: <code>/excluir ~/ruta</code>")
+            return
+        CA.add_exclude(parts[1])
+        send(token, chat, "✅ Añadido a exclusiones: <code>%s</code>" % esc(parts[1]))
+        return
+    if text.startswith("/quitar-exclusion"):
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            send(token, chat, "Uso: <code>/quitar-exclusion ~/ruta</code>")
+            return
+        ok = CA.remove_exclude(parts[1])
+        send(token, chat, ("✅ Quitado: <code>%s</code>" if ok else "⚠️ No estaba: <code>%s</code>")
+             % esc(parts[1]))
+        return
+    if text.startswith("/cancelar"):
+        STATE.pop(chat, None)
+        send(token, chat, "❌ <b>Cancelado</b>")
+        return
+
+
+def run_pending(token, chat):
+    if not os.path.exists(PENDING_PATH):
+        return
+    try:
+        with open(PENDING_PATH) as f:
+            data = json.load(f)
+        items = data.get("items") or []
+        group = data.get("group", "")
+    except Exception:
+        try:
+            os.remove(PENDING_PATH)
+        except Exception:
+            pass
+        return
+    if not items:
+        try:
+            os.remove(PENDING_PATH)
+        except Exception:
+            pass
+        return
+    CA.log("bot: retomando borrado pendiente de %d items" % len(items))
+    send(token, chat, "♻️ <b>Había un borrado pendiente</b> (%d items). Lo retomo…" % len(items))
+    try:
+        before = CA.disk_info()["free"]
+        res = CA.apply_items(items, yes=True, dry_run=False,
+                             thin=True, quarantine=True)
+        after = CA.disk_info()["free"]
+        net = after - before
+        send(token, chat,
+             "🎉 <b>Listo</b> (pendiente)\n🗑 Permanente: <b>%s</b>\n🗂 Cuarentena: <b>%s</b>\n"
+             "Libre: %s → <b>%s</b> (%s%s)"
+             % (CA.human(res.get("freed", 0)), CA.human(res.get("quarantined", 0)),
+                CA.human(before), CA.human(after),
+                "＋" if net >= 0 else "−", CA.human(abs(net))))
+    except Exception as e:
+        CA.log("bot pending apply error: %s" % e)
+        send(token, chat, "⚠️ <b>Error al borrar pendiente</b>\n<code>%s</code>" % esc(str(e)))
+    try:
+        os.remove(PENDING_PATH)
+    except Exception:
+        pass
+
+
+def main():
+    global OFFSET
+    token, chat = creds()
+    tries = 0
+    while (not token or not chat) and tries < 60:
+        time.sleep(5)
+        token, chat = creds()
+        tries += 1
+    if not token or not chat:
+        CA.log("bot: no token/chat en Llavero, saliendo")
+        sys.exit(1)
+    CA.log("bot: iniciado")
+    try:
+        run_pending(token, chat)
+    except Exception as e:
+        CA.log("bot: run_pending error: %s" % e)
+    while True:
+        try:
+            res = api(token, "getUpdates", offset=OFFSET, timeout=50,
+                      allowed_updates=json.dumps(["message", "callback_query"]))
+            for u in res.get("result", []):
+                OFFSET = u["update_id"] + 1
+                try:
+                    if "callback_query" in u:
+                        handle_callback(token, chat, u["callback_query"])
+                    elif "message" in u:
+                        if int(u["message"]["chat"]["id"]) == int(chat):
+                            handle_message(token, chat, u["message"])
+                except Exception as e:
+                    CA.log("bot handle error: %s" % e)
+        except Exception as e:
+            CA.log("bot poll error: %s" % e)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
